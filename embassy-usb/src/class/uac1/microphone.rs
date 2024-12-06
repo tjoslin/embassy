@@ -36,13 +36,29 @@ const MAX_SAMPLE_RATE_HZ: u32 = 0x7FFFFF;
 const INPUT_UNIT_ID: u8 = 0x01;
 
 /// Arbitrary unique identifier for the feature unit.
-const FEATURE_UNIT_ID: u8 = 0x02;
+//const FEATURE_UNIT_ID: u8 = 0x02;
 
 /// Arbitrary unique identifier for the output unit.
-const OUTPUT_UNIT_ID: u8 = 0x03;
+const OUTPUT_UNIT_ID: u8 = 0x02; //0x03;
+
+// Volume settings go from -25600 to 0, in steps of 256.
+// Therefore, the volume settings are 8q8 values in units of dB.
+const VOLUME_STEPS_PER_DB: i16 = 256;
+const MIN_VOLUME_DB: i16 = -100;
+const MAX_VOLUME_DB: i16 = 0;
 
 // Maximum number of supported discrete sample rates.
 const MAX_SAMPLE_RATE_COUNT: usize = 10;
+
+/// The volume of an audio channel.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Volume {
+    /// The channel is muted.
+    Muted,
+    /// The channel volume in dB. Ranges from `MIN_VOLUME_DB` (quietest) to `MAX_VOLUME_DB` (loudest).
+    DeciBel(f32),
+}
 
 /// Internal state for the USB Audio Class.
 pub struct State<'d> {
@@ -96,7 +112,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         sample_rates_hz: &[u32],
         channels: &'d [Channel],
         feedback_refresh_period: FeedbackRefresh,
-    ) -> (Stream<'d, D>, Feedback<'d, D>, ControlMonitor<'d>) {
+    ) -> (Stream<'d, D>, /*Feedback<'d, D>,*/ ControlMonitor<'d>) {
         // The class and subclass fields of the IAD aren't required to match the class and subclass fields of
         // the interfaces in the interface collection that the IAD describes. Microsoft recommends that
         // the first interface of the collection has class and subclass fields that match the class and
@@ -158,24 +174,24 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         // =====================================
         // Feature Unit Descriptor [UAC 4.3.2.5]
         // Mute and volume control
-//        let controls = MUTE_CONTROL | VOLUME_CONTROL;
-//
-//        const FEATURE_UNIT_DESCRIPTOR_SIZE: usize = 5;
-//        let mut feature_unit_descriptor: Vec<u8, { FEATURE_UNIT_DESCRIPTOR_SIZE + MAX_AUDIO_CHANNEL_COUNT + 1 }> =
-//            Vec::from_slice(&[
-//                FEATURE_UNIT,         // bDescriptorSubtype (Feature Unit)
-//                FEATURE_UNIT_ID,      // bUnitID
-//                INPUT_UNIT_ID,        // bSourceID
-//                1,                    // bControlSize (one byte per control)
-//                FU_CONTROL_UNDEFINED, // Master controls (disabled, use only per-channel control)
-//            ])
-//            .unwrap();
-//
-//        // Add per-channel controls
-//        for _channel in channels {
-//            feature_unit_descriptor.push(controls).unwrap();
-//        }
-//        feature_unit_descriptor.push(0x00).unwrap(); // iFeature (none)
+        //        let controls = MUTE_CONTROL | VOLUME_CONTROL;
+        //
+        //        const FEATURE_UNIT_DESCRIPTOR_SIZE: usize = 5;
+        //        let mut feature_unit_descriptor: Vec<u8, { FEATURE_UNIT_DESCRIPTOR_SIZE + MAX_AUDIO_CHANNEL_COUNT + 1 }> =
+        //            Vec::from_slice(&[
+        //                FEATURE_UNIT,         // bDescriptorSubtype (Feature Unit)
+        //                FEATURE_UNIT_ID,      // bUnitID
+        //                INPUT_UNIT_ID,        // bSourceID
+        //                1,                    // bControlSize (one byte per control)
+        //                FU_CONTROL_UNDEFINED, // Master controls (disabled, use only per-channel control)
+        //            ])
+        //            .unwrap();
+        //
+        //        // Add per-channel controls
+        //        for _channel in channels {
+        //            feature_unit_descriptor.push(controls).unwrap();
+        //        }
+        //        feature_unit_descriptor.push(0x00).unwrap(); // iFeature (none)
 
         // ===============================================
         // Format desciptor [UAC 4.5.3]
@@ -208,7 +224,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         for size in [
             INTERFACE_DESCRIPTOR_SIZE,
             input_terminal_descriptor.len(),
-//            feature_unit_descriptor.len(),
+            //            feature_unit_descriptor.len(),
             output_terminal_descriptor.len(),
         ] {
             total_descriptor_length += size + DESCRIPTOR_HEADER_SIZE;
@@ -226,7 +242,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 
         alt.descriptor(CS_INTERFACE, &interface_descriptor);
         alt.descriptor(CS_INTERFACE, &input_terminal_descriptor);
-//        alt.descriptor(CS_INTERFACE, &feature_unit_descriptor);
+        //        alt.descriptor(CS_INTERFACE, &feature_unit_descriptor);
         alt.descriptor(CS_INTERFACE, &output_terminal_descriptor);
 
         // =====================================================
@@ -242,9 +258,9 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         alt.descriptor(
             CS_INTERFACE,
             &[
-                AS_GENERAL,    // bDescriptorSubtype
+                AS_GENERAL,     // bDescriptorSubtype
                 OUTPUT_UNIT_ID, // bTerminalLink
-                0x00,          // bDelay (none)
+                0x01,           // bDelay (none)
                 PCM as u8,
                 (PCM >> 8) as u8, // wFormatTag (PCM format)
             ],
@@ -252,46 +268,46 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 
         alt.descriptor(CS_INTERFACE, &format_descriptor);
 
-        let streaming_endpoint = alt.alloc_endpoint_out(EndpointType::Isochronous, max_packet_size, 1);
-        let feedback_endpoint = alt.alloc_endpoint_in(
-            EndpointType::Isochronous,
-            4, // Feedback packets are 24 bit (10.14 format).
-            1,
-        );
+        let streaming_endpoint = alt.alloc_endpoint_in(EndpointType::Isochronous, max_packet_size, 1);
+        //let feedback_endpoint = alt.alloc_endpoint_in(
+        //    EndpointType::Isochronous,
+        //    4, // Feedback packets are 24 bit (10.14 format).
+        //    1,
+        //);
 
-        // Write the descriptor for the streaming endpoint, after knowing the address of the feedback endpoint.
+        // Write the descriptor for the streaming endpoint
         alt.endpoint_descriptor(
             streaming_endpoint.info(),
             SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
             &[
-                0x00,                                 // bRefresh (0)
-                feedback_endpoint.info().addr.into(), // bSynchAddress (the feedback endpoint)
+                0x00, // bRefresh (0)
+                0x00, // bSynchAddress (unused)
             ],
         );
 
         alt.descriptor(
             CS_ENDPOINT,
             &[
-                AS_GENERAL,            // bDescriptorSubtype (General)
-                SAMPLING_FREQ_CONTROL, // bmAttributes (support sampling frequency control)
-                0x02,                  // bLockDelayUnits (PCM)
+                AS_GENERAL, // bDescriptorSubtype (General)
+                SAMPLING_FREQ_CONTROL,       // bmAttributes (support sampling frequency control)
+                0x02,       // bLockDelayUnits (PCM)
                 0x0000 as u8,
                 (0x0000 >> 8) as u8, // wLockDelay (0)
             ],
         );
 
-        // Write the feedback endpoint descriptor after the streaming endpoint descriptor
-        // This is demanded by the USB audio class specification.
-        alt.endpoint_descriptor(
-            feedback_endpoint.info(),
-            SynchronizationType::NoSynchronization,
-            UsageType::FeedbackEndpoint,
-            &[
-                feedback_refresh_period as u8, // bRefresh
-                0x00,                          // bSynchAddress (none)
-            ],
-        );
+        //// Write the feedback endpoint descriptor after the streaming endpoint descriptor
+        //// This is demanded by the USB audio class specification.
+        //alt.endpoint_descriptor(
+        //    feedback_endpoint.info(),
+        //    SynchronizationType::NoSynchronization,
+        //    UsageType::FeedbackEndpoint,
+        //    &[
+        //        feedback_refresh_period as u8, // bRefresh
+        //        0x00,                          // bSynchAddress (none)
+        //    ],
+        //);
 
         // Free up the builder.
         drop(func);
@@ -311,7 +327,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 
         (
             Stream { streaming_endpoint },
-            Feedback { feedback_endpoint },
+            //Feedback { feedback_endpoint },
             ControlMonitor { shared: control },
         )
     }
@@ -389,13 +405,13 @@ impl<'d> SharedControl<'d> {
 
 /// Used for reading audio frames.
 pub struct Stream<'d, D: Driver<'d>> {
-    streaming_endpoint: D::EndpointOut,
+    streaming_endpoint: D::EndpointIn,
 }
 
 impl<'d, D: Driver<'d>> Stream<'d, D> {
     /// Reads a single packet from the OUT endpoint
-    pub async fn read_packet(&mut self, data: &mut [u8]) -> Result<usize, EndpointError> {
-        self.streaming_endpoint.read(data).await
+    pub async fn write_packet(&mut self, data: &mut [u8]) -> Result<(), EndpointError> {
+        self.streaming_endpoint.write(data).await
     }
 
     /// Waits for the USB host to enable this interface
@@ -528,10 +544,10 @@ impl<'d> Control<'d> {
             return None;
         }
 
-        if entity_index != FEATURE_UNIT_ID {
-            debug!("Unsupported interface set request for entity {}", entity_index);
-            return Some(OutResponse::Rejected);
-        }
+        //if entity_index != FEATURE_UNIT_ID {
+        //    debug!("Unsupported interface set request for entity {}", entity_index);
+        //    return Some(OutResponse::Rejected);
+        //}
 
         if req.request != SET_CUR {
             debug!("Unsupported interface set request type {}", req.request);
@@ -598,11 +614,11 @@ impl<'d> Control<'d> {
             return None;
         }
 
-        if entity_index != FEATURE_UNIT_ID {
-            // Only this function unit can be handled at the moment.
-            debug!("Unsupported interface get request for entity {}.", entity_index);
-            return Some(InResponse::Rejected);
-        }
+        //if entity_index != FEATURE_UNIT_ID {
+        //    // Only this function unit can be handled at the moment.
+        //    debug!("Unsupported interface get request for entity {}.", entity_index);
+        //    return Some(InResponse::Rejected);
+        //}
 
         let audio_settings = self.shared.audio_settings.lock(|x| x.get());
 
