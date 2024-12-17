@@ -23,6 +23,7 @@ const MAX_AUDIO_CHANNEL_COUNT: usize = MAX_AUDIO_CHANNEL_INDEX + 1;
 #[allow(missing_docs)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Channel {
+    Mono,
     LeftFront,
     RightFront,
     CenterFront,
@@ -41,6 +42,7 @@ impl Channel {
     /// Map a `Channel` to its corresponding USB Audio `ChannelConfig`.
     fn get_channel_config(&self) -> ChannelConfig {
         match self {
+            Channel::Mono => ChannelConfig::None,
             Channel::LeftFront => ChannelConfig::LeftFront,
             Channel::RightFront => ChannelConfig::RightFront,
             Channel::CenterFront => ChannelConfig::CenterFront,

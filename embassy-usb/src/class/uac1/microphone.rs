@@ -22,10 +22,10 @@ use heapless::Vec;
 
 use super::class_codes::*;
 use super::terminal_type::TerminalType;
-use super::{Channel, ChannelConfig, FeedbackRefresh, SampleWidth, MAX_AUDIO_CHANNEL_COUNT, MAX_AUDIO_CHANNEL_INDEX};
+use super::{Channel, ChannelConfig, SampleWidth, MAX_AUDIO_CHANNEL_COUNT, MAX_AUDIO_CHANNEL_INDEX};
 use crate::control::{self, InResponse, OutResponse, Recipient, Request, RequestType};
 use crate::descriptor::{SynchronizationType, UsageType};
-use crate::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointOut, EndpointType};
+use crate::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointType};
 use crate::types::InterfaceNumber;
 use crate::{Builder, Handler};
 
@@ -34,9 +34,6 @@ const MAX_SAMPLE_RATE_HZ: u32 = 0x7FFFFF;
 
 /// Arbitrary unique identifier for the input unit.
 const INPUT_UNIT_ID: u8 = 0x01;
-
-/// Arbitrary unique identifier for the feature unit.
-//const FEATURE_UNIT_ID: u8 = 0x02;
 
 /// Arbitrary unique identifier for the output unit.
 const OUTPUT_UNIT_ID: u8 = 0x02; //0x03;
@@ -103,7 +100,6 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
     /// * `resolution` - The audio sample resolution.
     /// * `sample_rates_hz` - The supported sample rates in Hz.
     /// * `channels` - The advertised audio channels (up to 12). Entries must be unique, or this function panics.
-    /// * `feedback_refresh_period` - The refresh period for the feedback value.
     pub fn new(
         builder: &mut Builder<'d, D>,
         state: &'d mut State<'d>,
@@ -111,7 +107,6 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         resolution: SampleWidth,
         sample_rates_hz: &[u32],
         channels: &'d [Channel],
-        feedback_refresh_period: FeedbackRefresh,
     ) -> (Stream<'d, D>, /*Feedback<'d, D>,*/ ControlMonitor<'d>) {
         // The class and subclass fields of the IAD aren't required to match the class and subclass fields of
         // the interfaces in the interface collection that the IAD describes. Microsoft recommends that
@@ -122,7 +117,9 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         // Audio control interface (mandatory) [UAC 4.3.1]
         let mut interface = func.interface();
         let control_interface = interface.interface_number().into();
+        defmt::info!("control if {:x}", control_interface);
         let streaming_interface = u8::from(control_interface) + 1;
+        defmt::info!("stream if {:x}", streaming_interface);
         let mut alt = interface.alt_setting(USB_AUDIO_CLASS, USB_AUDIOCONTROL_SUBCLASS, PROTOCOL_NONE, None);
 
         // Terminal topology:
@@ -145,13 +142,13 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         }
 
         let input_terminal_descriptor = [
-            INPUT_TERMINAL, // bDescriptorSubtype
-            INPUT_UNIT_ID,  // bTerminalID
-            terminal_type as u8,
-            (terminal_type >> 8) as u8, // wTerminalType
-            0x00,                       // bAssocTerminal (none)
-            channels.len() as u8,       // bNrChannels
-            channel_config as u8,
+            INPUT_TERMINAL,              // bDescriptorSubtype
+            INPUT_UNIT_ID,               // bTerminalID
+            terminal_type as u8,         //
+            (terminal_type >> 8) as u8,  // wTerminalType
+            0x00,                        // bAssocTerminal (none)
+            channels.len() as u8,        // bNrChannels
+            channel_config as u8,        //
             (channel_config >> 8) as u8, // wChannelConfig
             0x00,                        // iChannelNames (none)
             0x00,                        // iTerminal (none)
@@ -162,36 +159,14 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         // Audio Output
         let terminal_type: u16 = TerminalType::UsbStreaming.into();
         let output_terminal_descriptor = [
-            OUTPUT_TERMINAL, // bDescriptorSubtype
-            OUTPUT_UNIT_ID,  // bTerminalID
-            terminal_type as u8,
+            OUTPUT_TERMINAL,            // bDescriptorSubtype
+            OUTPUT_UNIT_ID,             // bTerminalID
+            terminal_type as u8,        //
             (terminal_type >> 8) as u8, // wTerminalType
             0x00,                       // bAssocTerminal (none)
             INPUT_UNIT_ID,              // bSourceID (the input unit)
             0x00,                       // iTerminal (none)
         ];
-
-        // =====================================
-        // Feature Unit Descriptor [UAC 4.3.2.5]
-        // Mute and volume control
-        //        let controls = MUTE_CONTROL | VOLUME_CONTROL;
-        //
-        //        const FEATURE_UNIT_DESCRIPTOR_SIZE: usize = 5;
-        //        let mut feature_unit_descriptor: Vec<u8, { FEATURE_UNIT_DESCRIPTOR_SIZE + MAX_AUDIO_CHANNEL_COUNT + 1 }> =
-        //            Vec::from_slice(&[
-        //                FEATURE_UNIT,         // bDescriptorSubtype (Feature Unit)
-        //                FEATURE_UNIT_ID,      // bUnitID
-        //                INPUT_UNIT_ID,        // bSourceID
-        //                1,                    // bControlSize (one byte per control)
-        //                FU_CONTROL_UNDEFINED, // Master controls (disabled, use only per-channel control)
-        //            ])
-        //            .unwrap();
-        //
-        //        // Add per-channel controls
-        //        for _channel in channels {
-        //            feature_unit_descriptor.push(controls).unwrap();
-        //        }
-        //        feature_unit_descriptor.push(0x00).unwrap(); // iFeature (none)
 
         // ===============================================
         // Format desciptor [UAC 4.5.3]
@@ -224,25 +199,26 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         for size in [
             INTERFACE_DESCRIPTOR_SIZE,
             input_terminal_descriptor.len(),
-            //            feature_unit_descriptor.len(),
             output_terminal_descriptor.len(),
         ] {
             total_descriptor_length += size + DESCRIPTOR_HEADER_SIZE;
         }
 
         let interface_descriptor: [u8; INTERFACE_DESCRIPTOR_SIZE] = [
-            HEADER_SUBTYPE, // bDescriptorSubtype (Header)
-            ADC_VERSION as u8,
-            (ADC_VERSION >> 8) as u8, // bcdADC
-            total_descriptor_length as u8,
+            HEADER_SUBTYPE,                       // bDescriptorSubtype (Header)
+            ADC_VERSION as u8,                    //
+            (ADC_VERSION >> 8) as u8,             // bcdADC
+            total_descriptor_length as u8,        //
             (total_descriptor_length >> 8) as u8, // wTotalLength
             0x01,                                 // bInCollection (1 streaming interface)
             streaming_interface,                  // baInterfaceNr
         ];
 
+        defmt::info!("if desc {:x}", interface_descriptor);
         alt.descriptor(CS_INTERFACE, &interface_descriptor);
+        defmt::info!("in desc {:x}", input_terminal_descriptor);
         alt.descriptor(CS_INTERFACE, &input_terminal_descriptor);
-        //        alt.descriptor(CS_INTERFACE, &feature_unit_descriptor);
+        defmt::info!("out desc {:x}", output_terminal_descriptor);
         alt.descriptor(CS_INTERFACE, &output_terminal_descriptor);
 
         // =====================================================
@@ -258,27 +234,21 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         alt.descriptor(
             CS_INTERFACE,
             &[
-                AS_GENERAL,     // bDescriptorSubtype
-                OUTPUT_UNIT_ID, // bTerminalLink
-                0x01,           // bDelay (none)
-                PCM as u8,
+                AS_GENERAL,       // bDescriptorSubtype
+                OUTPUT_UNIT_ID,   // bTerminalLink
+                0x01,             // bDelay (none)
+                PCM as u8,        //
                 (PCM >> 8) as u8, // wFormatTag (PCM format)
             ],
         );
 
+        defmt::info!("format desc {=[u8]:#02x}", format_descriptor);
         alt.descriptor(CS_INTERFACE, &format_descriptor);
 
-        let streaming_endpoint = alt.alloc_endpoint_in(EndpointType::Isochronous, max_packet_size, 1);
-        //let feedback_endpoint = alt.alloc_endpoint_in(
-        //    EndpointType::Isochronous,
-        //    4, // Feedback packets are 24 bit (10.14 format).
-        //    1,
-        //);
-
-        // Write the descriptor for the streaming endpoint
-        alt.endpoint_descriptor(
-            streaming_endpoint.info(),
-            SynchronizationType::Asynchronous,
+        let streaming_endpoint = alt.endpoint_isochronous_in(
+            max_packet_size,
+            1,
+            SynchronizationType::NoSynchronization,
             UsageType::DataEndpoint,
             &[
                 0x00, // bRefresh (0)
@@ -290,24 +260,12 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             CS_ENDPOINT,
             &[
                 AS_GENERAL, // bDescriptorSubtype (General)
-                SAMPLING_FREQ_CONTROL,       // bmAttributes (support sampling frequency control)
-                0x02,       // bLockDelayUnits (PCM)
+                0x00,       // bmAttributes (none)
+                0x00,       // bLockDelayUnits (unused)
                 0x0000 as u8,
-                (0x0000 >> 8) as u8, // wLockDelay (0)
+                (0x0000 >> 8) as u8, // wLockDelay (unused)
             ],
         );
-
-        //// Write the feedback endpoint descriptor after the streaming endpoint descriptor
-        //// This is demanded by the USB audio class specification.
-        //alt.endpoint_descriptor(
-        //    feedback_endpoint.info(),
-        //    SynchronizationType::NoSynchronization,
-        //    UsageType::FeedbackEndpoint,
-        //    &[
-        //        feedback_refresh_period as u8, // bRefresh
-        //        0x00,                          // bSynchAddress (none)
-        //    ],
-        //);
 
         // Free up the builder.
         drop(func);
@@ -700,7 +658,7 @@ impl<'d> Control<'d> {
         }
 
         let sample_rate_hz = self.shared.sample_rate_hz.load(Ordering::Relaxed);
-
+        debug!("sample_rate_hz: {}", sample_rate_hz);
         buf[0] = (sample_rate_hz & 0xFF) as u8;
         buf[1] = ((sample_rate_hz >> 8) & 0xFF) as u8;
         buf[2] = ((sample_rate_hz >> 16) & 0xFF) as u8;
