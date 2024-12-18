@@ -7,25 +7,22 @@
 //! - sample rate
 //! - sample resolution
 //! - audio channel count and assignment
-//!
-//! The class provides volume and mute controls for each channel.
 
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
 
-use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_sync::waitqueue::WakerRegistration;
 use heapless::Vec;
 
 use super::class_codes::*;
 use super::terminal_type::TerminalType;
-use super::{Channel, ChannelConfig, SampleWidth, MAX_AUDIO_CHANNEL_COUNT, MAX_AUDIO_CHANNEL_INDEX};
+use super::{Channel, ChannelConfig, SampleWidth};
 use crate::control::{self, InResponse, OutResponse, Recipient, Request, RequestType};
 use crate::descriptor::{SynchronizationType, UsageType};
-use crate::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointType};
+use crate::driver::{Driver, Endpoint, EndpointError, EndpointIn};
 use crate::types::InterfaceNumber;
 use crate::{Builder, Handler};
 
@@ -36,26 +33,10 @@ const MAX_SAMPLE_RATE_HZ: u32 = 0x7FFFFF;
 const INPUT_UNIT_ID: u8 = 0x01;
 
 /// Arbitrary unique identifier for the output unit.
-const OUTPUT_UNIT_ID: u8 = 0x02; //0x03;
-
-// Volume settings go from -25600 to 0, in steps of 256.
-// Therefore, the volume settings are 8q8 values in units of dB.
-const VOLUME_STEPS_PER_DB: i16 = 256;
-const MIN_VOLUME_DB: i16 = -100;
-const MAX_VOLUME_DB: i16 = 0;
+const OUTPUT_UNIT_ID: u8 = 0x02;
 
 // Maximum number of supported discrete sample rates.
 const MAX_SAMPLE_RATE_COUNT: usize = 10;
-
-/// The volume of an audio channel.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Volume {
-    /// The channel is muted.
-    Muted,
-    /// The channel volume in dB. Ranges from `MIN_VOLUME_DB` (quietest) to `MAX_VOLUME_DB` (loudest).
-    DeciBel(f32),
-}
 
 /// Internal state for the USB Audio Class.
 pub struct State<'d> {
@@ -79,18 +60,17 @@ impl<'d> State<'d> {
     }
 }
 
-/// Implementation of the USB audio class 1.0.
+/// Implementation of the USB audio class 1.0 Microphone
 pub struct Microphone<'d, D: Driver<'d>> {
     phantom: PhantomData<&'d D>,
 }
 
 impl<'d, D: Driver<'d>> Microphone<'d, D> {
-    /// Creates a new [`Microphone`] device, split into a stream, feedback, and a control change notifier.
+    /// Creates a new [`Microphone`] device, split into a stream and control change notifier.
     ///
     /// The packet size should be chosen, based on the expected transfer size of samples per (micro)frame.
     /// For example, a stereo stream at 32 bit resolution and 48 kHz sample rate yields packets of 384 byte for
     /// full-speed USB (1 ms frame interval) or 48 byte for high-speed USB (125 us microframe interval).
-    /// When using feedback, the packet size varies and thus, the `max_packet_size` should be increased (e.g. to double).
     ///
     /// # Arguments
     ///
@@ -283,32 +263,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 
         let control = &state.shared;
 
-        (
-            Stream { streaming_endpoint },
-            //Feedback { feedback_endpoint },
-            ControlMonitor { shared: control },
-        )
-    }
-}
-
-/// Audio settings for the feature unit.
-///
-/// Contains volume and mute control.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct AudioSettings {
-    /// Channel mute states.
-    muted: [bool; MAX_AUDIO_CHANNEL_COUNT],
-    /// Channel volume levels in 8.8 format (in dB).
-    volume_8q8_db: [i16; MAX_AUDIO_CHANNEL_COUNT],
-}
-
-impl Default for AudioSettings {
-    fn default() -> Self {
-        AudioSettings {
-            muted: [true; MAX_AUDIO_CHANNEL_COUNT],
-            volume_8q8_db: [MAX_VOLUME_DB * VOLUME_STEPS_PER_DB; MAX_AUDIO_CHANNEL_COUNT],
-        }
+        (Stream { streaming_endpoint }, ControlMonitor { shared: control })
     }
 }
 
@@ -320,9 +275,6 @@ struct Control<'d> {
 
 /// Shared data between [`Control`] and the [`Speaker`] class.
 struct SharedControl<'d> {
-    /// The collection of audio settings (volumes, mute states).
-    audio_settings: CriticalSectionMutex<Cell<AudioSettings>>,
-
     /// Channel assignments.
     channels: &'d [Channel],
 
@@ -337,7 +289,6 @@ struct SharedControl<'d> {
 impl<'d> Default for SharedControl<'d> {
     fn default() -> Self {
         SharedControl {
-            audio_settings: CriticalSectionMutex::new(Cell::new(AudioSettings::default())),
             channels: &[],
             sample_rate_hz: AtomicU32::new(0),
             waker: RefCell::new(WakerRegistration::new()),
@@ -398,38 +349,12 @@ impl<'d, D: Driver<'d>> Feedback<'d, D> {
 /// Control status change monitor
 ///
 /// Await [`ControlMonitor::changed`] for being notified of configuration changes. Afterwards, the updated
-/// configuration settings can be read with [`ControlMonitor::volume`] and [`ControlMonitor::sample_rate_hz`].
+/// configuration settings can be read with [`ControlMonitor::sample_rate_hz`].
 pub struct ControlMonitor<'d> {
     shared: &'d SharedControl<'d>,
 }
 
 impl<'d> ControlMonitor<'d> {
-    fn audio_settings(&self) -> AudioSettings {
-        let audio_settings = self.shared.audio_settings.lock(|x| x.get());
-
-        audio_settings
-    }
-
-    fn get_logical_channel(&self, search_channel: Channel) -> Option<usize> {
-        let index = self.shared.channels.iter().position(|&c| c == search_channel)?;
-
-        // The logical channels start at one (zero is the master channel).
-        Some(index + 1)
-    }
-
-    /// Get the volume of a selected channel.
-    pub fn volume(&self, channel: Channel) -> Option<Volume> {
-        let channel_index = self.get_logical_channel(channel)?;
-
-        if self.audio_settings().muted[channel_index] {
-            return Some(Volume::Muted);
-        }
-
-        Some(Volume::DeciBel(
-            (self.audio_settings().volume_8q8_db[channel_index] as f32) / 256.0f32,
-        ))
-    }
-
     /// Get the streaming endpoint's sample rate in Hz.
     pub fn sample_rate_hz(&self) -> u32 {
         self.shared.sample_rate_hz.load(Ordering::Relaxed)
@@ -447,88 +372,19 @@ impl<'d> Control<'d> {
         self.shared.waker.borrow_mut().wake();
     }
 
-    fn interface_set_mute_state(
-        &mut self,
-        audio_settings: &mut AudioSettings,
-        channel_index: u8,
-        data: &[u8],
-    ) -> OutResponse {
-        let mute_state = data[0] != 0;
-
-        match channel_index as usize {
-            ..=MAX_AUDIO_CHANNEL_INDEX => {
-                audio_settings.muted[channel_index as usize] = mute_state;
-            }
-            _ => {
-                debug!("Failed to set channel {} mute state: {}", channel_index, mute_state);
-                return OutResponse::Rejected;
-            }
-        }
-
-        debug!("Set channel {} mute state: {}", channel_index, mute_state);
-        OutResponse::Accepted
-    }
-
-    fn interface_set_volume(
-        &mut self,
-        audio_settings: &mut AudioSettings,
-        channel_index: u8,
-        data: &[u8],
-    ) -> OutResponse {
-        let volume = i16::from_ne_bytes(data[..2].try_into().expect("Failed to read volume."));
-
-        match channel_index as usize {
-            ..=MAX_AUDIO_CHANNEL_INDEX => {
-                audio_settings.volume_8q8_db[channel_index as usize] = volume;
-            }
-            _ => {
-                debug!("Failed to set channel {} volume: {}", channel_index, volume);
-                return OutResponse::Rejected;
-            }
-        }
-
-        debug!("Set channel {} volume: {}", channel_index, volume);
-        OutResponse::Accepted
-    }
-
     fn interface_set_request(&mut self, req: control::Request, data: &[u8]) -> Option<OutResponse> {
         let interface_number = req.index as u8;
         let entity_index = (req.index >> 8) as u8;
-        let channel_index = req.value as u8;
-        let control_unit = (req.value >> 8) as u8;
+        let _ = data; // not currently using the data
 
         if interface_number != self.control_interface_number.into() {
             debug!("Unhandled interface set request for interface {}", interface_number);
             return None;
         }
 
-        //if entity_index != FEATURE_UNIT_ID {
-        //    debug!("Unsupported interface set request for entity {}", entity_index);
-        //    return Some(OutResponse::Rejected);
-        //}
-
-        if req.request != SET_CUR {
-            debug!("Unsupported interface set request type {}", req.request);
-            return Some(OutResponse::Rejected);
-        }
-
-        let mut audio_settings = self.shared.audio_settings.lock(|x| x.get());
-        let response = match control_unit {
-            MUTE_CONTROL => self.interface_set_mute_state(&mut audio_settings, channel_index, data),
-            VOLUME_CONTROL => self.interface_set_volume(&mut audio_settings, channel_index, data),
-            _ => OutResponse::Rejected,
-        };
-
-        if response == OutResponse::Rejected {
-            return Some(response);
-        }
-
-        // Store updated settings
-        self.shared.audio_settings.lock(|x| x.set(audio_settings));
-
-        self.changed();
-
-        Some(OutResponse::Accepted)
+        // Not currently handling any interface requests for any entity
+        debug!("Unsupported interface set request for entity {}.", entity_index);
+        return Some(OutResponse::Rejected);
     }
 
     fn endpoint_set_request(&mut self, req: control::Request, data: &[u8]) -> Option<OutResponse> {
@@ -564,80 +420,16 @@ impl<'d> Control<'d> {
     fn interface_get_request<'r>(&'r mut self, req: Request, buf: &'r mut [u8]) -> Option<InResponse<'r>> {
         let interface_number = req.index as u8;
         let entity_index = (req.index >> 8) as u8;
-        let channel_index = req.value as u8;
-        let control_unit = (req.value >> 8) as u8;
+        let _ = buf; // not currently returning any data
 
         if interface_number != self.control_interface_number.into() {
             debug!("Unhandled interface get request for interface {}.", interface_number);
             return None;
         }
 
-        //if entity_index != FEATURE_UNIT_ID {
-        //    // Only this function unit can be handled at the moment.
-        //    debug!("Unsupported interface get request for entity {}.", entity_index);
-        //    return Some(InResponse::Rejected);
-        //}
-
-        let audio_settings = self.shared.audio_settings.lock(|x| x.get());
-
-        match req.request {
-            GET_CUR => match control_unit {
-                VOLUME_CONTROL => {
-                    let volume: i16;
-
-                    match channel_index as usize {
-                        ..=MAX_AUDIO_CHANNEL_INDEX => volume = audio_settings.volume_8q8_db[channel_index as usize],
-                        _ => return Some(InResponse::Rejected),
-                    }
-
-                    buf[0] = volume as u8;
-                    buf[1] = (volume >> 8) as u8;
-
-                    debug!("Got channel {} volume: {}.", channel_index, volume);
-                    return Some(InResponse::Accepted(&buf[..2]));
-                }
-                MUTE_CONTROL => {
-                    let mute_state: bool;
-
-                    match channel_index as usize {
-                        ..=MAX_AUDIO_CHANNEL_INDEX => mute_state = audio_settings.muted[channel_index as usize],
-                        _ => return Some(InResponse::Rejected),
-                    }
-
-                    buf[0] = mute_state.into();
-                    debug!("Got channel {} mute state: {}.", channel_index, mute_state);
-                    return Some(InResponse::Accepted(&buf[..1]));
-                }
-                _ => return Some(InResponse::Rejected),
-            },
-            GET_MIN => match control_unit {
-                VOLUME_CONTROL => {
-                    let min_volume = MIN_VOLUME_DB * VOLUME_STEPS_PER_DB;
-                    buf[0] = min_volume as u8;
-                    buf[1] = (min_volume >> 8) as u8;
-                    return Some(InResponse::Accepted(&buf[..2]));
-                }
-                _ => return Some(InResponse::Rejected),
-            },
-            GET_MAX => match control_unit {
-                VOLUME_CONTROL => {
-                    let max_volume = MAX_VOLUME_DB * VOLUME_STEPS_PER_DB;
-                    buf[0] = max_volume as u8;
-                    buf[1] = (max_volume >> 8) as u8;
-                    return Some(InResponse::Accepted(&buf[..2]));
-                }
-                _ => return Some(InResponse::Rejected),
-            },
-            GET_RES => match control_unit {
-                VOLUME_CONTROL => {
-                    buf[0] = VOLUME_STEPS_PER_DB as u8;
-                    buf[1] = (VOLUME_STEPS_PER_DB >> 8) as u8;
-                    return Some(InResponse::Accepted(&buf[..2]));
-                }
-                _ => return Some(InResponse::Rejected),
-            },
-            _ => return Some(InResponse::Rejected),
-        }
+        // Not currently handling any interface requests for any entity
+        debug!("Unsupported interface get request for entity {}.", entity_index);
+        return Some(InResponse::Rejected);
     }
 
     fn endpoint_get_request<'r>(&'r mut self, req: Request, buf: &'r mut [u8]) -> Option<InResponse<'r>> {
@@ -699,8 +491,6 @@ impl<'d> Handler for Control<'d> {
     /// Called after a USB reset after the bus reset sequence is complete.
     fn reset(&mut self) {
         let shared = self.shared;
-        shared.audio_settings.lock(|x| x.set(AudioSettings::default()));
-
         shared.changed.store(true, Ordering::Relaxed);
         shared.waker.borrow_mut().wake();
     }
