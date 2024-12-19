@@ -1,7 +1,7 @@
 //! USB Audio Class 1.0 - Microphone device
 //!
 //! Provides a class with a single audio streaming interface (device to host),
-//! that advertises itself as a microphone. Includes explicit sample rate feedback.
+//! that advertises itself as a microphone.
 //!
 //! Various aspects of the audio stream can be configured, for example:
 //! - sample rate
@@ -34,6 +34,9 @@ const INPUT_UNIT_ID: u8 = 0x01;
 
 /// Arbitrary unique identifier for the output unit.
 const OUTPUT_UNIT_ID: u8 = 0x02;
+
+/// Alt setting for streaming data
+const STREAMING_ALT_SETTING: u8 = 0x01;
 
 // Maximum number of supported discrete sample rates.
 const MAX_SAMPLE_RATE_COUNT: usize = 10;
@@ -103,7 +106,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         let mut alt = interface.alt_setting(USB_AUDIO_CLASS, USB_AUDIOCONTROL_SUBCLASS, PROTOCOL_NONE, None);
 
         // Terminal topology:
-        // Input terminal (receives audio stream) -> Feature Unit (mute and volume) -> Output terminal (e.g. towards speaker)
+        // Input terminal (audio data from mic) -> Output terminal (e.g. towards host)
 
         // =======================================
         // Input Terminal Descriptor [UAC 4.3.2.1]
@@ -256,6 +259,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         state.control = Some(Control {
             shared: &state.shared,
             streaming_endpoint_address: streaming_endpoint.info().addr.into(),
+            streaming_interface: streaming_interface,
             control_interface_number: control_interface,
         });
 
@@ -270,16 +274,20 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 struct Control<'d> {
     control_interface_number: InterfaceNumber,
     streaming_endpoint_address: u8,
+    streaming_interface: u8,
     shared: &'d SharedControl<'d>,
 }
 
-/// Shared data between [`Control`] and the [`Speaker`] class.
+/// Shared data between [`Control`] and the [`Microphone`] class.
 struct SharedControl<'d> {
     /// Channel assignments.
     channels: &'d [Channel],
 
     /// The audio sample rate in Hz.
     sample_rate_hz: AtomicU32,
+
+    /// true if streaming alt setting is not zero bw
+    streaming: AtomicBool,
 
     // Notification mechanism.
     waker: RefCell<WakerRegistration>,
@@ -291,6 +299,7 @@ impl<'d> Default for SharedControl<'d> {
         SharedControl {
             channels: &[],
             sample_rate_hz: AtomicU32::new(0),
+            streaming: AtomicBool::new(false),
             waker: RefCell::new(WakerRegistration::new()),
             changed: AtomicBool::new(false),
         }
@@ -329,23 +338,6 @@ impl<'d, D: Driver<'d>> Stream<'d, D> {
     }
 }
 
-/// Used for writing sample rate information over the feedback endpoint.
-pub struct Feedback<'d, D: Driver<'d>> {
-    feedback_endpoint: D::EndpointIn,
-}
-
-impl<'d, D: Driver<'d>> Feedback<'d, D> {
-    /// Writes a single packet into the IN endpoint.
-    pub async fn write_packet(&mut self, data: &[u8]) -> Result<(), EndpointError> {
-        self.feedback_endpoint.write(data).await
-    }
-
-    /// Waits for the USB host to enable this interface.
-    pub async fn wait_connection(&mut self) {
-        self.feedback_endpoint.wait_enabled().await;
-    }
-}
-
 /// Control status change monitor
 ///
 /// Await [`ControlMonitor::changed`] for being notified of configuration changes. Afterwards, the updated
@@ -358,6 +350,11 @@ impl<'d> ControlMonitor<'d> {
     /// Get the streaming endpoint's sample rate in Hz.
     pub fn sample_rate_hz(&self) -> u32 {
         self.shared.sample_rate_hz.load(Ordering::Relaxed)
+    }
+
+    /// Get the streaming status
+    pub fn streaming(&self) -> bool {
+        self.shared.streaming.load(Ordering::Relaxed)
     }
 
     /// Return a future for when the control settings change.
@@ -486,6 +483,13 @@ impl<'d> Handler for Control<'d> {
             "USB set interface number {} to alt setting {}.",
             iface, alternate_setting
         );
+
+        if u8::from(iface) == self.streaming_interface {
+            let streaming: bool = alternate_setting == STREAMING_ALT_SETTING;
+            debug!("streaming set to {}", streaming);
+            self.shared.streaming.store(streaming, Ordering::Relaxed);
+            self.changed();
+        }
     }
 
     /// Called after a USB reset after the bus reset sequence is complete.
