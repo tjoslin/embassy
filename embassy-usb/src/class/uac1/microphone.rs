@@ -100,9 +100,9 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         // Audio control interface (mandatory) [UAC 4.3.1]
         let mut interface = func.interface();
         let control_interface = interface.interface_number().into();
-        defmt::info!("control if {:x}", control_interface);
+        debug!("control if {:x}", control_interface);
         let streaming_interface = u8::from(control_interface) + 1;
-        defmt::info!("stream if {:x}", streaming_interface);
+        debug!("stream if {:x}", streaming_interface);
         let mut alt = interface.alt_setting(USB_AUDIO_CLASS, USB_AUDIOCONTROL_SUBCLASS, PROTOCOL_NONE, None);
 
         // Terminal topology:
@@ -197,11 +197,11 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             streaming_interface,                  // baInterfaceNr
         ];
 
-        defmt::info!("if desc {:x}", interface_descriptor);
+        debug!("if desc {:x}", interface_descriptor);
         alt.descriptor(CS_INTERFACE, &interface_descriptor);
-        defmt::info!("in desc {:x}", input_terminal_descriptor);
+        debug!("in desc {:x}", input_terminal_descriptor);
         alt.descriptor(CS_INTERFACE, &input_terminal_descriptor);
-        defmt::info!("out desc {:x}", output_terminal_descriptor);
+        debug!("out desc {:x}", output_terminal_descriptor);
         alt.descriptor(CS_INTERFACE, &output_terminal_descriptor);
 
         // =====================================================
@@ -225,7 +225,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             ],
         );
 
-        defmt::info!("format desc {=[u8]:#02x}", format_descriptor);
+        debug!("format desc {=[u8]:#02x}", format_descriptor);
         alt.descriptor(CS_INTERFACE, &format_descriptor);
 
         let streaming_endpoint = alt.endpoint_isochronous_in(
