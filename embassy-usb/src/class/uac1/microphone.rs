@@ -14,8 +14,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
 
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::blocking_mutex::Mutex as CriticalSectionMutex;
+use embassy_sync::blocking_mutex::CriticalSectionMutex;
 
 use embassy_sync::waitqueue::WakerRegistration;
 use heapless::Vec;
@@ -325,8 +324,11 @@ struct Control<'d> {
     shared: &'d SharedControl<'d>,
 }
 
-/// Shared data between [`Control`] and the [`Microphone`] class.
-/// Audio settings for controlling volume, mute, etc.
+/// Audio settings for the feature unit.
+///
+/// Contains volume and mute control.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AudioSettings {
     /// Channel mute states.
     muted: [bool; MAX_AUDIO_CHANNEL_COUNT],
