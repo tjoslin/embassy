@@ -144,14 +144,14 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 
         // ========================================
         // Output Terminal Descriptor [UAC 4.3.2.2]
-        // Audio Output
+        // USB Streaming Output
         let terminal_type: u16 = TerminalType::UsbStreaming.into();
         let output_terminal_descriptor = [
             OUTPUT_TERMINAL,            // bDescriptorSubtype
             OUTPUT_UNIT_ID,             // bTerminalID
             terminal_type as u8,        //
             (terminal_type >> 8) as u8, // wTerminalType
-            INPUT_UNIT_ID,              // bAssocTerminal (none)
+            INPUT_UNIT_ID,              // bAssocTerminal (input terminal)
             FEATURE_UNIT_ID,            // bSourceID (the feature unit)
             0x00,                       // iTerminal (none)
         ];
@@ -159,11 +159,11 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         const FEATURE_UNIT_DESCRIPTOR_SIZE: usize = 5;
         let mut feature_unit_descriptor: Vec<u8, { FEATURE_UNIT_DESCRIPTOR_SIZE + MAX_AUDIO_CHANNEL_COUNT + 1 }> =
             Vec::from_slice(&[
-                FEATURE_UNIT,                               // bDescriptorSubtype (Feature Unit)
-                FEATURE_UNIT_ID,                            // bUnitID
-                INPUT_UNIT_ID,                              // bSourceID
-                1,                                          // bControlSize (one byte per control)
-                MUTE_CONTROL | VOLUME_CONTROL,              // Master controls (mute and volume)
+                FEATURE_UNIT,                  // bDescriptorSubtype (Feature Unit)
+                FEATURE_UNIT_ID,               // bUnitID
+                INPUT_UNIT_ID,                 // bSourceID
+                1,                             // bControlSize (one byte per control)
+                MUTE_CONTROL | VOLUME_CONTROL, // Master controls (mute and volume)
             ])
             .unwrap();
 
@@ -243,7 +243,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             &[
                 AS_GENERAL,       // bDescriptorSubtype
                 OUTPUT_UNIT_ID,   // bTerminalLink
-                0x01,             // bDelay (none)
+                0x01,             // bDelay (1 frame)
                 PCM as u8,        //
                 (PCM >> 8) as u8, // wFormatTag (PCM format)
             ],
@@ -252,9 +252,8 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         debug!("format desc {=[u8]:#02x}", format_descriptor);
         alt.descriptor(CS_INTERFACE, &format_descriptor);
 
-
         let streaming_endpoint = alt.alloc_endpoint_in(EndpointType::Isochronous, max_packet_size, 1);
-        
+
         // For Asynchronous mode, we need a feedback endpoint
         let feedback_endpoint = alt.alloc_endpoint_out(
             EndpointType::Isochronous,
@@ -268,19 +267,19 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             SynchronizationType::Asynchronous, // Per UAC1.0 spec, for microphone, use Asynchronous mode
             UsageType::DataEndpoint,
             &[
-                0x05,                                    // bRefresh (32ms = 2^5ms)
-                feedback_endpoint.info().addr.into(),    // bSynchAddress (the feedback endpoint)
+                0x05,                                 // bRefresh (32ms = 2^5ms)
+                feedback_endpoint.info().addr.into(), // bSynchAddress (the feedback endpoint)
             ],
         );
 
         alt.descriptor(
             CS_ENDPOINT,
             &[
-                AS_GENERAL,                // bDescriptorSubtype (General)
-                SAMPLING_FREQ_CONTROL,     // bmAttributes (Sampling Frequency Control)
-                0x01,                      // bLockDelayUnits (ms)
+                AS_GENERAL,            // bDescriptorSubtype (General)
+                SAMPLING_FREQ_CONTROL, // bmAttributes (Sampling Frequency Control)
+                0x01,                  // bLockDelayUnits (ms)
                 0x0001 as u8,
-                (0x0001 >> 8) as u8,       // wLockDelay (1ms)
+                (0x0001 >> 8) as u8, // wLockDelay (1ms)
             ],
         );
 
@@ -291,8 +290,8 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             SynchronizationType::NoSynchronization,
             UsageType::FeedbackEndpoint,
             &[
-                0x00,                      // bRefresh (none)
-                0x00,                      // bSynchAddress (none)
+                0x00, // bRefresh (none)
+                0x00, // bSynchAddress (none)
             ],
         );
 
@@ -397,7 +396,7 @@ pub struct Stream<'d, D: Driver<'d>> {
 }
 
 impl<'d, D: Driver<'d>> Stream<'d, D> {
-    /// Reads a single packet from the OUT endpoint
+    /// Writes a single packet to the IN endpoint
     pub async fn write_packet(&mut self, data: &mut [u8]) -> Result<(), EndpointError> {
         self.streaming_endpoint.write(data).await
     }
@@ -411,7 +410,8 @@ impl<'d, D: Driver<'d>> Stream<'d, D> {
 /// Control status change monitor
 ///
 /// Await [`ControlMonitor::changed`] for being notified of configuration changes. Afterwards, the updated
-/// configuration settings can be read with [`ControlMonitor::sample_rate_hz`].
+/// configuration settings can be read with [`ControlMonitor::sample_rate_hz`] or volume/mute state through
+/// the audio settings.
 pub struct ControlMonitor<'d> {
     shared: &'d SharedControl<'d>,
 }
@@ -601,10 +601,7 @@ impl<'d> Control<'d> {
                     return Some(InResponse::Accepted(&buf[..1]));
                 }
                 _ => {
-                    debug!(
-                        "Unsupported interface get request control selector {}.",
-                        control_unit
-                    );
+                    debug!("Unsupported interface get request control selector {}.", control_unit);
                     return Some(InResponse::Rejected);
                 }
             },
