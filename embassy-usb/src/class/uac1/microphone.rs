@@ -8,20 +8,18 @@
 //! - sample resolution
 //! - audio channel count and assignment
 
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
-
-use embassy_sync::blocking_mutex::CriticalSectionMutex;
 
 use embassy_sync::waitqueue::WakerRegistration;
 use heapless::Vec;
 
 use super::class_codes::*;
 use super::terminal_type::TerminalType;
-use super::{Channel, ChannelConfig, SampleWidth, MAX_AUDIO_CHANNEL_COUNT};
+use super::{Channel, ChannelConfig, SampleWidth};
 use crate::control::{self, InResponse, OutResponse, Recipient, Request, RequestType};
 use crate::descriptor::{SynchronizationType, UsageType};
 use crate::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointType};
@@ -37,8 +35,9 @@ const INPUT_UNIT_ID: u8 = 0x01;
 /// Arbitrary unique identifier for the output unit.
 const OUTPUT_UNIT_ID: u8 = 0x02;
 
-/// Arbitrary unique identifier for the feature unit.
-const FEATURE_UNIT_ID: u8 = 0x03;
+// REMOVED: Feature Unit ID since we're not implementing volume/mute controls
+// /// Arbitrary unique identifier for the feature unit.
+// const FEATURE_UNIT_ID: u8 = 0x03;
 
 /// Alt setting for streaming data
 const STREAMING_ALT_SETTING: u8 = 0x01;
@@ -95,7 +94,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         resolution: SampleWidth,
         sample_rates_hz: &[u32],
         channels: &'d [Channel],
-    ) -> (Stream<'d, D>, ControlMonitor<'d>) {
+    ) -> (Stream<'d, D>, /*FeedbackStream<'d, D>,*/ ControlMonitor<'d>) {
         // The class and subclass fields of the IAD aren't required to match the class and subclass fields of
         // the interfaces in the interface collection that the IAD describes. Microsoft recommends that
         // the first interface of the collection has class and subclass fields that match the class and
@@ -119,22 +118,27 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         let terminal_type: u16 = TerminalType::InMicrophone.into();
 
         // Assemble channel configuration field
-        let mut channel_config: u16 = ChannelConfig::None.into();
-        for channel in channels {
-            let channel: u16 = channel.get_channel_config().into();
-
-            if channel_config & channel != 0 {
-                panic!("Invalid channel config, duplicate channel {}.", channel);
-            }
-            channel_config |= channel;
-        }
+        // The working microphone has wChannelConfig 0x0003 (Front Left + Front Right)
+        // even if it's actually just mono. Let's use that configuration.
+        let channel_config: u16 = 0x0003; // Front Left (0x0001) + Front Right (0x0002)
+        
+        // Ignore the channel configuration from the parameters
+        // let mut channel_config: u16 = ChannelConfig::None.into();
+        // for channel in channels {
+        //     let channel: u16 = channel.get_channel_config().into();
+        //
+        //     if channel_config & channel != 0 {
+        //         panic!("Invalid channel config, duplicate channel {}.", channel);
+        //     }
+        //     channel_config |= channel;
+        // }
 
         let input_terminal_descriptor = [
             INPUT_TERMINAL,              // bDescriptorSubtype
             INPUT_UNIT_ID,               // bTerminalID
             terminal_type as u8,         //
             (terminal_type >> 8) as u8,  // wTerminalType
-            OUTPUT_UNIT_ID,              // bAssocTerminal (none)
+            OUTPUT_UNIT_ID,              // bAssocTerminal (properly associated with output terminal)
             channels.len() as u8,        // bNrChannels
             channel_config as u8,        //
             (channel_config >> 8) as u8, // wChannelConfig
@@ -151,27 +155,27 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             OUTPUT_UNIT_ID,             // bTerminalID
             terminal_type as u8,        //
             (terminal_type >> 8) as u8, // wTerminalType
-            INPUT_UNIT_ID,              // bAssocTerminal (input terminal)
-            FEATURE_UNIT_ID,            // bSourceID (the feature unit)
+            INPUT_UNIT_ID,              // bAssocTerminal (properly associated with input terminal)
+            INPUT_UNIT_ID,              // bSourceID (directly from input terminal, not through feature unit)
             0x00,                       // iTerminal (none)
         ];
 
-        const FEATURE_UNIT_DESCRIPTOR_SIZE: usize = 5;
-        let mut feature_unit_descriptor: Vec<u8, { FEATURE_UNIT_DESCRIPTOR_SIZE + MAX_AUDIO_CHANNEL_COUNT + 1 }> =
-            Vec::from_slice(&[
-                FEATURE_UNIT,                  // bDescriptorSubtype (Feature Unit)
-                FEATURE_UNIT_ID,               // bUnitID
-                INPUT_UNIT_ID,                 // bSourceID
-                1,                             // bControlSize (one byte per control)
-                MUTE_CONTROL | VOLUME_CONTROL, // Master controls (mute and volume)
-            ])
-            .unwrap();
+        // REMOVED: Feature Unit Descriptor - we're not implementing volume/mute controls
+        // const FEATURE_UNIT_DESCRIPTOR_SIZE: usize = 5;
+        // let mut feature_unit_descriptor: Vec<u8, { FEATURE_UNIT_DESCRIPTOR_SIZE + MAX_AUDIO_CHANNEL_COUNT }> =
+        //     Vec::from_slice(&[
+        //         FEATURE_UNIT,    // bDescriptorSubtype (Feature Unit)
+        //         FEATURE_UNIT_ID, // bUnitID
+        //         INPUT_UNIT_ID,   // bSourceID
+        //         1,               // bControlSize (one byte per control)
+        //     ])
+        //     .unwrap();
 
-        // Add per-channel controls (mute and volume for each channel)
-        for _channel in channels {
-            feature_unit_descriptor.push(MUTE_CONTROL | VOLUME_CONTROL).unwrap();
-        }
-        feature_unit_descriptor.push(0x00).unwrap(); // iFeature (none)
+        // // Add per-channel controls (mute and volume for each channel)
+        // for _channel in channels {
+        //     feature_unit_descriptor.push(MUTE_CONTROL | VOLUME_CONTROL).unwrap();
+        // }
+        // feature_unit_descriptor.push(0x00).unwrap(); // iFeature (none)
 
         // ===============================================
         // Format desciptor [UAC 4.5.3]
@@ -179,7 +183,7 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         let mut format_descriptor: Vec<u8, { 6 + 3 * MAX_SAMPLE_RATE_COUNT }> = Vec::from_slice(&[
             FORMAT_TYPE,               // bDescriptorSubtype
             FORMAT_TYPE_I,             // bFormatType
-            channels.len() as u8,      // bNrChannels
+            2,                         // bNrChannels (2 channels, to match wChannelConfig)
             resolution as u8,          // bSubframeSize
             resolution.in_bit() as u8, // bBitResolution
         ])
@@ -201,11 +205,12 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 
         let mut total_descriptor_length = 0;
 
+        // Calculate total descriptor length (without the feature unit descriptor)
         for size in [
             INTERFACE_DESCRIPTOR_SIZE,
             input_terminal_descriptor.len(),
             output_terminal_descriptor.len(),
-            feature_unit_descriptor.len(),
+            // feature_unit_descriptor.len(), // Feature unit descriptor removed
         ] {
             total_descriptor_length += size + DESCRIPTOR_HEADER_SIZE;
         }
@@ -226,7 +231,8 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         alt.descriptor(CS_INTERFACE, &input_terminal_descriptor);
         debug!("out desc {:x}", output_terminal_descriptor);
         alt.descriptor(CS_INTERFACE, &output_terminal_descriptor);
-        alt.descriptor(CS_INTERFACE, &feature_unit_descriptor);
+        // Feature unit descriptor removed
+        // alt.descriptor(CS_INTERFACE, &feature_unit_descriptor);
 
         // =====================================================
         // Audio streaming interface, zero-bandwidth [UAC 4.5.1]
@@ -252,23 +258,26 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
         debug!("format desc {=[u8]:#02x}", format_descriptor);
         alt.descriptor(CS_INTERFACE, &format_descriptor);
 
+        defmt::debug!("Allocating streaming endpoint with max_packet_size: {} bytes", max_packet_size);
+        // The working mic has a max packet size of 288 bytes (0x120)
+        // Make sure yours is at least this size for 2 channels at 24-bit
         let streaming_endpoint = alt.alloc_endpoint_in(EndpointType::Isochronous, max_packet_size, 1);
 
-        // For Asynchronous mode, we need a feedback endpoint
-        let feedback_endpoint = alt.alloc_endpoint_out(
-            EndpointType::Isochronous,
-            3, // Feedback packets are 3 bytes (24-bit)
-            1,
-        );
+        //// For Asynchronous mode, we need a feedback endpoint
+        //let feedback_endpoint = alt.alloc_endpoint_in(
+        //    EndpointType::Isochronous,
+        //    3, // Feedback packets are 3 bytes (24-bit)
+        //    1,
+        //);
 
         // Write the descriptor for the streaming endpoint, after knowing the address of the feedback endpoint.
         alt.endpoint_descriptor(
             streaming_endpoint.info(),
-            SynchronizationType::Asynchronous, // Per UAC1.0 spec, for microphone, use Asynchronous mode
+            SynchronizationType::Synchronous,
             UsageType::DataEndpoint,
             &[
-                0x05,                                 // bRefresh (32ms = 2^5ms)
-                feedback_endpoint.info().addr.into(), // bSynchAddress (the feedback endpoint)
+                0x00, //0x05,                                 // bRefresh (32ms = 2^5ms)
+                0x00, //feedback_endpoint.info().addr.into(), // bSynchAddress (the feedback endpoint)
             ],
         );
 
@@ -277,23 +286,23 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
             &[
                 AS_GENERAL,            // bDescriptorSubtype (General)
                 SAMPLING_FREQ_CONTROL, // bmAttributes (Sampling Frequency Control)
-                0x01,                  // bLockDelayUnits (ms)
-                0x0001 as u8,
-                (0x0001 >> 8) as u8, // wLockDelay (1ms)
+                0x00,                  // bLockDelayUnits (undefined)
+                0x0000 as u8,
+                (0x0000 >> 8) as u8, // wLockDelay (none)
             ],
         );
 
-        // Write the feedback endpoint descriptor after the streaming endpoint descriptor
-        // This is demanded by the USB audio class specification.
-        alt.endpoint_descriptor(
-            feedback_endpoint.info(),
-            SynchronizationType::NoSynchronization,
-            UsageType::FeedbackEndpoint,
-            &[
-                0x00, // bRefresh (none)
-                0x00, // bSynchAddress (none)
-            ],
-        );
+        //// Write the feedback endpoint descriptor after the streaming endpoint descriptor
+        //// This is demanded by the USB audio class specification.
+        //alt.endpoint_descriptor(
+        //    feedback_endpoint.info(),
+        //    SynchronizationType::NoSynchronization,
+        //    UsageType::FeedbackEndpoint,
+        //    &[
+        //        0x00, // bRefresh (none)
+        //        0x00, // bSynchAddress (none)
+        //    ],
+        //);
 
         // Free up the builder.
         drop(func);
@@ -312,7 +321,11 @@ impl<'d, D: Driver<'d>> Microphone<'d, D> {
 
         let control = &state.shared;
 
-        (Stream { streaming_endpoint }, ControlMonitor { shared: control })
+        (
+            Stream { streaming_endpoint },
+            //FeedbackStream { feedback_endpoint },
+            ControlMonitor { shared: control },
+        )
     }
 }
 
@@ -323,26 +336,27 @@ struct Control<'d> {
     shared: &'d SharedControl<'d>,
 }
 
-/// Audio settings for the feature unit.
-///
-/// Contains volume and mute control.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct AudioSettings {
-    /// Channel mute states.
-    muted: [bool; MAX_AUDIO_CHANNEL_COUNT],
-    /// Channel volume levels in 8.8 format (in dB).
-    volume_8q8_db: [i16; MAX_AUDIO_CHANNEL_COUNT],
-}
-
-impl Default for AudioSettings {
-    fn default() -> Self {
-        AudioSettings {
-            muted: [false; MAX_AUDIO_CHANNEL_COUNT],
-            volume_8q8_db: [0; MAX_AUDIO_CHANNEL_COUNT], // Default to 0 dB
-        }
-    }
-}
+// REMOVED: Audio settings struct for volume and mute controls
+// /// Audio settings for the feature unit.
+// ///
+// /// Contains volume and mute control.
+// #[derive(Clone, Copy, Debug)]
+// #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+// pub struct AudioSettings {
+//     /// Channel mute states.
+//     muted: [bool; MAX_AUDIO_CHANNEL_COUNT],
+//     /// Channel volume levels in 8.8 format (in dB).
+//     volume_8q8_db: [i16; MAX_AUDIO_CHANNEL_COUNT],
+// }
+//
+// impl Default for AudioSettings {
+//     fn default() -> Self {
+//         AudioSettings {
+//             muted: [false; MAX_AUDIO_CHANNEL_COUNT],
+//             volume_8q8_db: [0; MAX_AUDIO_CHANNEL_COUNT], // Default to 0 dB
+//         }
+//     }
+// }
 
 struct SharedControl<'d> {
     /// Channel assignments.
@@ -354,8 +368,9 @@ struct SharedControl<'d> {
     /// true if streaming alt setting is not zero bw
     streaming: AtomicBool,
 
-    /// Audio control settings such as volume and mute
-    audio_settings: CriticalSectionMutex<Cell<AudioSettings>>,
+    // REMOVED: Audio settings for volume/mute controls
+    // /// Audio control settings such as volume and mute
+    // audio_settings: CriticalSectionMutex<Cell<AudioSettings>>,
 
     // Notification mechanism.
     waker: RefCell<WakerRegistration>,
@@ -368,7 +383,7 @@ impl<'d> Default for SharedControl<'d> {
             channels: &[],
             sample_rate_hz: AtomicU32::new(0),
             streaming: AtomicBool::new(false),
-            audio_settings: CriticalSectionMutex::new(Cell::new(AudioSettings::default())),
+            // audio_settings: CriticalSectionMutex::new(Cell::new(AudioSettings::default())),
             waker: RefCell::new(WakerRegistration::new()),
             changed: AtomicBool::new(false),
         }
@@ -407,6 +422,47 @@ impl<'d, D: Driver<'d>> Stream<'d, D> {
     }
 }
 
+/// Used for sending feedback data to the host.
+///
+/// In asynchronous mode, the feedback endpoint sends information about the actual sampling rate
+/// at which the device is operating.
+pub struct FeedbackStream<'d, D: Driver<'d>> {
+    feedback_endpoint: D::EndpointIn,
+}
+
+impl<'d, D: Driver<'d>> FeedbackStream<'d, D> {
+    /// Sends a feedback packet to the OUT endpoint.
+    ///
+    /// For full-speed USB, the format is a 3-byte (24-bit) value in 10.14 fixed-point format
+    /// representing the number of samples per frame:
+    ///
+    /// `feedback_value = (actual_sample_rate * 2^14) / 1000`
+    ///
+    /// For high-speed USB (microframes), use:
+    ///
+    /// `feedback_value = (actual_sample_rate * 2^14) / 8000`
+
+    /// Sends a feedback value directly using the sample rate
+    pub async fn send_feedback(&mut self, actual_sample_rate: u32, is_high_speed: bool) -> Result<(), EndpointError> {
+        // Calculate feedback value in 10.14 format
+        let divisor = if is_high_speed { 8000 } else { 1000 };
+        let feedback_value = (actual_sample_rate * (1 << 14)) / divisor;
+
+        // Prepare 3-byte (24-bit) data
+        let mut data = [0u8; 3];
+        data[0] = (feedback_value & 0xFF) as u8;
+        data[1] = ((feedback_value >> 8) & 0xFF) as u8;
+        data[2] = ((feedback_value >> 16) & 0xFF) as u8;
+
+        self.feedback_endpoint.write(&data).await
+    }
+
+    /// Waits for the USB host to enable this interface
+    pub async fn wait_connection(&mut self) {
+        self.feedback_endpoint.wait_enabled().await;
+    }
+}
+
 /// Control status change monitor
 ///
 /// Await [`ControlMonitor::changed`] for being notified of configuration changes. Afterwards, the updated
@@ -439,88 +495,92 @@ impl<'d> Control<'d> {
         self.shared.waker.borrow_mut().wake();
     }
 
-    fn interface_set_mute_state(
-        &mut self,
-        audio_settings: &mut AudioSettings,
-        channel_index: u8,
-        data: &[u8],
-    ) -> OutResponse {
-        let mute_state = data[0] != 0;
+    // REMOVED: Volume and mute control methods
 
-        match channel_index as usize {
-            ..=MAX_AUDIO_CHANNEL_COUNT => {
-                audio_settings.muted[channel_index as usize] = mute_state;
-            }
-            _ => {
-                debug!("Failed to set channel {} mute state: {}", channel_index, mute_state);
-                return OutResponse::Rejected;
-            }
-        }
+    // fn interface_set_mute_state(
+    //     &mut self,
+    //     audio_settings: &mut AudioSettings,
+    //     channel_index: u8,
+    //     data: &[u8],
+    // ) -> OutResponse {
+    //     let mute_state = data[0] != 0;
+    //
+    //     match channel_index as usize {
+    //         ..=MAX_AUDIO_CHANNEL_COUNT => {
+    //             audio_settings.muted[channel_index as usize] = mute_state;
+    //         }
+    //         _ => {
+    //             debug!("Failed to set channel {} mute state: {}", channel_index, mute_state);
+    //             return OutResponse::Rejected;
+    //         }
+    //     }
+    //
+    //     debug!("Set channel {} mute state: {}", channel_index, mute_state);
+    //     OutResponse::Accepted
+    // }
+    //
+    // fn interface_set_volume(
+    //     &mut self,
+    //     audio_settings: &mut AudioSettings,
+    //     channel_index: u8,
+    //     data: &[u8],
+    // ) -> OutResponse {
+    //     let volume = i16::from_ne_bytes(data[..2].try_into().expect("Failed to read volume."));
+    //
+    //     match channel_index as usize {
+    //         ..=MAX_AUDIO_CHANNEL_COUNT => {
+    //             audio_settings.volume_8q8_db[channel_index as usize] = volume;
+    //         }
+    //         _ => {
+    //             debug!("Failed to set channel {} volume: {}", channel_index, volume);
+    //             return OutResponse::Rejected;
+    //         }
+    //     }
+    //
+    //     debug!("Set channel {} volume: {}", channel_index, volume);
+    //     OutResponse::Accepted
+    // }
 
-        debug!("Set channel {} mute state: {}", channel_index, mute_state);
-        OutResponse::Accepted
-    }
-
-    fn interface_set_volume(
-        &mut self,
-        audio_settings: &mut AudioSettings,
-        channel_index: u8,
-        data: &[u8],
-    ) -> OutResponse {
-        let volume = i16::from_ne_bytes(data[..2].try_into().expect("Failed to read volume."));
-
-        match channel_index as usize {
-            ..=MAX_AUDIO_CHANNEL_COUNT => {
-                audio_settings.volume_8q8_db[channel_index as usize] = volume;
-            }
-            _ => {
-                debug!("Failed to set channel {} volume: {}", channel_index, volume);
-                return OutResponse::Rejected;
-            }
-        }
-
-        debug!("Set channel {} volume: {}", channel_index, volume);
-        OutResponse::Accepted
-    }
-
-    fn interface_set_request(&mut self, req: control::Request, data: &[u8]) -> Option<OutResponse> {
+    fn interface_set_request(&mut self, req: control::Request, _data: &[u8]) -> Option<OutResponse> {
         let interface_number = req.index as u8;
-        let entity_index = (req.index >> 8) as u8;
-        let channel_index = req.value as u8;
-        let control_unit = (req.value >> 8) as u8;
 
         if interface_number != self.control_interface_number.into() {
             debug!("Unhandled interface set request for interface {}", interface_number);
             return None;
         }
 
-        if entity_index != FEATURE_UNIT_ID {
-            debug!("Unsupported interface set request for entity {}", entity_index);
-            return Some(OutResponse::Rejected);
-        }
+        // We no longer handle any interface requests since we removed the feature unit
+        debug!("No interface set requests supported - feature unit removed");
+        return Some(OutResponse::Rejected);
 
-        if req.request != SET_CUR {
-            debug!("Unsupported interface set request type {}", req.request);
-            return Some(OutResponse::Rejected);
-        }
-
-        let mut audio_settings = self.shared.audio_settings.lock(|x| x.get());
-        let response = match control_unit {
-            MUTE_CONTROL => self.interface_set_mute_state(&mut audio_settings, channel_index, data),
-            VOLUME_CONTROL => self.interface_set_volume(&mut audio_settings, channel_index, data),
-            _ => OutResponse::Rejected,
-        };
-
-        if response == OutResponse::Rejected {
-            return Some(response);
-        }
-
-        // Store updated settings
-        self.shared.audio_settings.lock(|x| x.set(audio_settings));
-
-        self.changed();
-
-        Some(OutResponse::Accepted)
+        // REMOVED: Feature unit handling
+        // if entity_index != FEATURE_UNIT_ID {
+        //     debug!("Unsupported interface set request for entity {}", entity_index);
+        //     return Some(OutResponse::Rejected);
+        // }
+        //
+        // if req.request != SET_CUR {
+        //     debug!("Unsupported interface set request type {}", req.request);
+        //     return Some(OutResponse::Rejected);
+        // }
+        //
+        // let mut audio_settings = self.shared.audio_settings.lock(|x| x.get());
+        // let response = match control_unit {
+        //     MUTE_CONTROL => self.interface_set_mute_state(&mut audio_settings, channel_index, data),
+        //     VOLUME_CONTROL => self.interface_set_volume(&mut audio_settings, channel_index, data),
+        //     _ => OutResponse::Rejected,
+        // };
+        //
+        // if response == OutResponse::Rejected {
+        //     return Some(response);
+        // }
+        //
+        // // Store updated settings
+        // self.shared.audio_settings.lock(|x| x.set(audio_settings));
+        //
+        // self.changed();
+        //
+        // Some(OutResponse::Accepted)
     }
 
     fn endpoint_set_request(&mut self, req: control::Request, data: &[u8]) -> Option<OutResponse> {
@@ -553,63 +613,45 @@ impl<'d> Control<'d> {
         Some(OutResponse::Accepted)
     }
 
-    fn interface_get_request<'r>(&'r mut self, req: Request, buf: &'r mut [u8]) -> Option<InResponse<'r>> {
+    fn interface_get_request<'r>(&'r mut self, req: Request, _buf: &'r mut [u8]) -> Option<InResponse<'r>> {
         let interface_number = req.index as u8;
-        let entity_index = (req.index >> 8) as u8;
-        let channel_index = req.value as u8;
-        let control_unit = (req.value >> 8) as u8;
 
         if interface_number != self.control_interface_number.into() {
             debug!("Unhandled interface get request for interface {}.", interface_number);
             return None;
         }
 
-        if entity_index != FEATURE_UNIT_ID {
-            // Only this feature unit can be handled at the moment.
-            debug!("Unsupported interface get request for entity {}.", entity_index);
-            return Some(InResponse::Rejected);
-        }
+        // We no longer handle any interface get requests since we removed the feature unit
+        debug!("No interface get requests supported - feature unit removed");
+        return Some(InResponse::Rejected);
 
-        let audio_settings = self.shared.audio_settings.lock(|x| x.get());
-
-        match req.request {
-            GET_CUR => match control_unit {
-                VOLUME_CONTROL => {
-                    let volume: i16;
-
-                    match channel_index as usize {
-                        ..=MAX_AUDIO_CHANNEL_COUNT => volume = audio_settings.volume_8q8_db[channel_index as usize],
-                        _ => return Some(InResponse::Rejected),
-                    }
-
-                    buf[0] = volume as u8;
-                    buf[1] = (volume >> 8) as u8;
-
-                    debug!("Got channel {} volume: {}.", channel_index, volume);
-                    return Some(InResponse::Accepted(&buf[..2]));
-                }
-                MUTE_CONTROL => {
-                    let mute_state: bool;
-
-                    match channel_index as usize {
-                        ..=MAX_AUDIO_CHANNEL_COUNT => mute_state = audio_settings.muted[channel_index as usize],
-                        _ => return Some(InResponse::Rejected),
-                    }
-
-                    buf[0] = mute_state.into();
-                    debug!("Got channel {} mute state: {}.", channel_index, mute_state);
-                    return Some(InResponse::Accepted(&buf[..1]));
-                }
-                _ => {
-                    debug!("Unsupported interface get request control selector {}.", control_unit);
-                    return Some(InResponse::Rejected);
-                }
-            },
-            _ => {
-                debug!("Unsupported interface get request {}.", req.request);
-                return Some(InResponse::Rejected);
-            }
-        }
+        // REMOVED: Feature unit handling
+        // if entity_index != FEATURE_UNIT_ID {
+        //     // Only this feature unit can be handled at the moment.
+        //     debug!("Unsupported interface get request for entity {}.", entity_index);
+        //     return Some(InResponse::Rejected);
+        // }
+        //
+        // let audio_settings = self.shared.audio_settings.lock(|x| x.get());
+        //
+        // match req.request {
+        //     GET_CUR => match control_unit {
+        //         // ...long handler for volume and mute controls
+        //     },
+        //     GET_MIN => match control_unit {
+        //         // ...min value handlers
+        //     },
+        //     GET_MAX => match control_unit {
+        //         // ...max value handlers
+        //     },
+        //     GET_RES => match control_unit {
+        //         // ...resolution handlers
+        //     },
+        //     _ => {
+        //         debug!("Unsupported interface get request {}.", req.request);
+        //         return Some(InResponse::Rejected);
+        //     }
+        // }
     }
 
     fn endpoint_get_request<'r>(&'r mut self, req: Request, buf: &'r mut [u8]) -> Option<InResponse<'r>> {
@@ -617,25 +659,87 @@ impl<'d> Control<'d> {
         let endpoint_address = req.index as u8;
 
         if endpoint_address != self.streaming_endpoint_address {
-            debug!("Unhandled endpoint get request for endpoint {}.", endpoint_address);
+            defmt::debug!(
+                "Unhandled endpoint get request for endpoint {:#x}. Expected {:#x}",
+                endpoint_address,
+                self.streaming_endpoint_address
+            );
             return None;
         }
 
-        if control_selector != SAMPLING_FREQ_CONTROL as u8 {
-            debug!(
-                "Unsupported endpoint get request for control selector {}.",
+        if control_selector != SAMPLING_FREQ_CONTROL {
+            defmt::debug!(
+                "Unsupported endpoint get request for control selector {:#x}",
                 control_selector
             );
             return Some(InResponse::Rejected);
         }
 
         let sample_rate_hz = self.shared.sample_rate_hz.load(Ordering::Relaxed);
-        debug!("sample_rate_hz: {}", sample_rate_hz);
-        buf[0] = (sample_rate_hz & 0xFF) as u8;
-        buf[1] = ((sample_rate_hz >> 8) & 0xFF) as u8;
-        buf[2] = ((sample_rate_hz >> 16) & 0xFF) as u8;
 
-        Some(InResponse::Accepted(&buf[..3]))
+        match req.request {
+            GET_CUR => {
+                buf[0] = (sample_rate_hz & 0xFF) as u8;
+                buf[1] = ((sample_rate_hz >> 8) & 0xFF) as u8;
+                buf[2] = ((sample_rate_hz >> 16) & 0xFF) as u8;
+                defmt::debug!(
+                    "GET_CUR sampling freq request: {:#x}, EP: {:#x}, returning: {}Hz ({:x} {:x} {:x})",
+                    req.request,
+                    endpoint_address,
+                    sample_rate_hz,
+                    buf[0],
+                    buf[1],
+                    buf[2]
+                );
+                Some(InResponse::Accepted(&buf[..3]))
+            }
+            GET_MIN => {
+                // For a fixed sample rate device, MIN = MAX = CUR
+                buf[0] = (sample_rate_hz & 0xFF) as u8;
+                buf[1] = ((sample_rate_hz >> 8) & 0xFF) as u8;
+                buf[2] = ((sample_rate_hz >> 16) & 0xFF) as u8;
+                defmt::debug!(
+                    "GET_MIN sampling freq request: {:#x}, EP: {:#x}, returning: {}Hz",
+                    req.request,
+                    endpoint_address,
+                    sample_rate_hz
+                );
+                Some(InResponse::Accepted(&buf[..3]))
+            }
+            GET_MAX => {
+                // For a fixed sample rate device, MIN = MAX = CUR
+                buf[0] = (sample_rate_hz & 0xFF) as u8;
+                buf[1] = ((sample_rate_hz >> 8) & 0xFF) as u8;
+                buf[2] = ((sample_rate_hz >> 16) & 0xFF) as u8;
+                defmt::debug!(
+                    "GET_MAX sampling freq request: {:#x}, EP: {:#x}, returning: {}Hz",
+                    req.request,
+                    endpoint_address,
+                    sample_rate_hz
+                );
+                Some(InResponse::Accepted(&buf[..3]))
+            }
+            GET_RES => {
+                // Resolution for fixed sample rate device is 0
+                buf[0] = 0;
+                buf[1] = 0;
+                buf[2] = 0;
+                defmt::debug!(
+                    "GET_RES sampling freq request: {:#x}, EP: {:#x}, returning: 0 (fixed rate)",
+                    req.request,
+                    endpoint_address
+                );
+                Some(InResponse::Accepted(&buf[..3]))
+            }
+            _ => {
+                defmt::debug!(
+                    "Unsupported endpoint get request {:#x} for EP {:#x}",
+                    req.request,
+                    endpoint_address
+                );
+                Some(InResponse::Rejected)
+            }
+        }
     }
 }
 
@@ -669,7 +773,8 @@ impl<'d> Handler for Control<'d> {
 
         if u8::from(iface) == self.streaming_interface {
             let streaming: bool = alternate_setting == STREAMING_ALT_SETTING;
-            debug!("streaming set to {}", streaming);
+            defmt::info!("USB Audio streaming interface {} set to alt setting {}, streaming = {}", 
+                     iface, alternate_setting, streaming);
             self.shared.streaming.store(streaming, Ordering::Relaxed);
             self.changed();
         }
